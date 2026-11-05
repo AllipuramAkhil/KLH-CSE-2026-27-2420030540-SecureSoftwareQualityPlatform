@@ -1,0 +1,62 @@
+# === Maven ===
+target/
+pom.xml.tag
+pom.xml.releaseBackup
+pom.xml.versionsBackup
+pom.xml.next
+release.properties
+dependency-reduced-pom.xml
+buildNumber.properties
+.mvn/timing.properties
+.mvn/wrapper/maven-wrapper.jar
+
+# === Compiled class files ===
+*.class
+
+# === IDEs ===
+.idea/
+*.iml
+*.iws
+*.ipr
+.vscode/
+.classpath
+.project
+.settings/
+.factorypath
+*.launch
+.apt_generated/
+.springBeans
+
+# === Environment / secrets ===
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+*.p12
+
+# === Logs ===
+*.log
+logs/
+spring.log
+
+# === Uploaded source files (runtime storage) ===
+uploads/
+
+# === OS files ===
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# === Test / coverage output ===
+/coverage/
+*.exec
+
+# === Node (if a frontend is added alongside) ===
+node_modules/
+
+# === Misc ===
+*.bak
+*.tmp
+*.orig
+HELP.md

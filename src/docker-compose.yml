@@ -1,0 +1,179 @@
+name: assqp
+
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: assqp-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?set MYSQL_ROOT_PASSWORD in .env}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-assqp_db}
+      MYSQL_USER: ${MYSQL_USER:-assqp}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?set MYSQL_PASSWORD in .env}
+    ports:
+      - "${MYSQL_PORT:-3306}:3306"
+    volumes:
+      - assqp_mysql_data:/var/lib/mysql
+    networks:
+      - assqp-network
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p${MYSQL_ROOT_PASSWORD}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: assqp-backend
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+      ml-service:
+        condition: service_started
+    environment:
+      SERVER_PORT: 8080
+      SPRING_PROFILES_ACTIVE: ${SPRING_PROFILES_ACTIVE:-dev}
+      DB_URL: jdbc:mysql://mysql:3306/${MYSQL_DATABASE:-assqp_db}?createDatabaseIfNotExist=true
+      DB_USERNAME: ${MYSQL_USER:-assqp}
+      DB_PASSWORD: ${MYSQL_PASSWORD:?set MYSQL_PASSWORD in .env}
+      DDL_AUTO: ${DDL_AUTO:-update}
+      SHOW_SQL: ${SHOW_SQL:-false}
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env}
+      JWT_EXPIRATION: ${JWT_EXPIRATION:-3600000}
+      JWT_REFRESH_EXPIRATION: ${JWT_REFRESH_EXPIRATION:-604800000}
+      # Security fix: CI/CD webhook calls must be signed with this secret (see
+      # WebhookSignatureFilter) - required, same as JWT_SECRET, not given a default here.
+      WEBHOOK_SECRET: ${WEBHOOK_SECRET:?set WEBHOOK_SECRET in .env}
+      AI_API_KEY: ${AI_API_KEY:-}
+      AI_API_URL: ${AI_API_URL:-}
+      AI_API_MODEL: ${AI_API_MODEL:-claude-sonnet-4-6}
+      UPLOAD_DIR: /app/uploads
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      JACOCO_REPORT_PATH: ${JACOCO_REPORT_PATH:-./target/site/jacoco/jacoco.xml}
+      # Populated in later phases (SonarQube, Trivy, ZAP, ML service) -
+      # left here so the same compose file keeps working as those land.
+      SONAR_HOST_URL: ${SONAR_HOST_URL:-}
+      SONAR_TOKEN: ${SONAR_TOKEN:-}
+      SONAR_PROJECT_KEY: ${SONAR_PROJECT_KEY:-}
+      ML_SERVICE_URL: ${ML_SERVICE_URL:-http://ml-service:8000}
+      ML_SERVICE_TIMEOUT_SECONDS: ${ML_SERVICE_TIMEOUT_SECONDS:-10}
+      # Defense-in-depth alongside removing ml-service's host port mapping below.
+      ML_INTERNAL_SECRET: ${ML_INTERNAL_SECRET:-}
+      TRIVY_BINARY_PATH: ${TRIVY_BINARY_PATH:-trivy}
+      # Security fix: TRIVY_SCAN_TARGET and any per-request targetPath are now resolved
+      # relative to, and confined within, TRIVY_SCAN_ALLOWED_ROOT (default ./uploads inside
+      # the container) - arbitrary server paths can no longer be scanned.
+      TRIVY_SCAN_TARGET: ${TRIVY_SCAN_TARGET:-.}
+      TRIVY_SCAN_ALLOWED_ROOT: ${TRIVY_SCAN_ALLOWED_ROOT:-/app/uploads}
+      # ZAP_API_URL defaults to the optional `zap` service below (only
+      # reachable if it's actually started, see the "security" profile).
+      # Leave blank to disable live scanning and rely on import-file only.
+      ZAP_API_URL: ${ZAP_API_URL:-}
+      ZAP_API_KEY: ${ZAP_API_KEY:-}
+      ZAP_ALLOWED_TARGETS: ${ZAP_ALLOWED_TARGETS:-}
+      ZAP_SCAN_TIMEOUT_SECONDS: ${ZAP_SCAN_TIMEOUT_SECONDS:-120}
+      # Points at the repo mounted read-only below (Phase 9). Locally
+      # (non-Docker) the default in application.properties is '.', which
+      # works fine since the backend then runs from inside the checkout.
+      GIT_REPO_PATH: ${GIT_REPO_PATH:-/repo}
+      GIT_CHURN_LOOKBACK_DAYS: ${GIT_CHURN_LOOKBACK_DAYS:-90}
+      GIT_CHURN_MAX_COMMITS: ${GIT_CHURN_MAX_COMMITS:-500}
+    ports:
+      - "${BACKEND_PORT:-8080}:8080"
+    volumes:
+      - assqp_backend_uploads:/app/uploads
+      # Read-only mount of the whole project (including .git) so Phase 9's
+      # local git-churn analysis has real history to read inside the
+      # container. Omit this (and leave GIT_REPO_PATH unset) if you'd
+      # rather churn analysis just report unavailable in Docker - it
+      # degrades gracefully either way, nothing else depends on it.
+      - .:/repo:ro
+    networks:
+      - assqp-network
+
+  ml-service:
+    build:
+      context: ./ml-service
+      dockerfile: Dockerfile
+    container_name: assqp-ml-service
+    restart: unless-stopped
+    environment:
+      ML_MODEL_DIR: /app/models
+      ML_DATA_DIR: /app/data
+      # Must match the backend's ML_INTERNAL_SECRET above - guards POST /retrain.
+      ML_INTERNAL_SECRET: ${ML_INTERNAL_SECRET:-}
+    # Security fix (audit issue #4): this used to publish 8000 to the host, making the
+    # unauthenticated FastAPI service - including POST /retrain, which can run for minutes -
+    # reachable from outside Docker entirely. The backend reaches it over the internal
+    # "assqp-network" bridge at http://ml-service:8000 (see ML_SERVICE_URL above); nothing
+    # outside the Docker network needs a direct connection. If you need to hit it directly
+    # for local debugging, temporarily add back:
+    #   ports:
+    #     - "127.0.0.1:8000:8000"   # bind to localhost only, never 0.0.0.0, and never in prod
+    volumes:
+      # So a trained model / dataset survive `docker compose down` and
+      # rebuilds - the image also trains one at build time if these are
+      # empty, but the volume takes precedence once populated.
+      - assqp_ml_models:/app/models
+      - assqp_ml_data:/app/data
+    networks:
+      - assqp-network
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-http://localhost:8080/api}
+    container_name: assqp-frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      - "${FRONTEND_PORT:-5173}:80"
+    networks:
+      - assqp-network
+
+  # Optional OWASP ZAP daemon (Phase 6). NOT started by a plain
+  # `docker compose up` - it's a heavier image and most contributors won't
+  # need live DAST scanning day-to-day. Start it explicitly with:
+  #   docker compose --profile security up
+  # Then set ZAP_API_URL=http://zap:8080 and ZAP_ALLOWED_TARGETS to include
+  # http://frontend:5173 (or whatever's actually reachable from this
+  # container) in your .env before triggering a scan. Without this
+  # service running, ZAP endpoints return 503 and import-file still works.
+  zap:
+    image: zaproxy/zap-stable:latest
+    container_name: assqp-zap
+    restart: unless-stopped
+    profiles: ["security"]
+    command: >
+      zap.sh -daemon -host 0.0.0.0 -port 8080
+      -config api.addrs.addr.name=.*
+      -config api.addrs.addr.regex=true
+      -config api.key=${ZAP_API_KEY:-}
+      -config api.disablekey=${ZAP_DISABLE_API_KEY:-false}
+    ports:
+      - "${ZAP_PORT:-8090}:8080"
+    networks:
+      - assqp-network
+
+networks:
+  assqp-network:
+    driver: bridge
+
+volumes:
+  assqp_mysql_data:
+  assqp_backend_uploads:
+  assqp_ml_models:
+  assqp_ml_data:

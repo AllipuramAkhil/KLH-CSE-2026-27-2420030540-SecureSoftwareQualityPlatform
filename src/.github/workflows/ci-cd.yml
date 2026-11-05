@@ -1,0 +1,399 @@
+name: ASSQP CI/CD
+
+# ============================================================
+# Pipeline stages (per project spec):
+#   checkout -> build backend -> unit tests -> JaCoCo coverage ->
+#   SonarQube (conditional) -> Trivy scan -> Docker build ->
+#   OWASP ZAP baseline (optional) -> upload artifacts
+#
+# Design principles:
+#   - SonarQube and ZAP are OPTIONAL: if the required secrets/vars are
+#     not configured, those steps are skipped with a clear log message
+#     rather than failing the build.
+#   - Trivy runs unconditionally (no credentials required) and never
+#     fails the build on findings (exit-code 0) - it reports, it doesn't
+#     gate. Flip TRIVY_EXIT_CODE to '1' once you want it to be a hard gate.
+#   - No secrets are hardcoded; everything comes from GitHub Secrets/Vars.
+# ============================================================
+
+on:
+  push:
+    branches: [main, master, develop]
+  pull_request:
+    branches: [main, master, develop]
+  workflow_dispatch:
+    inputs:
+      run_zap:
+        description: "Run the optional OWASP ZAP baseline scan"
+        type: boolean
+        default: false
+
+env:
+  JAVA_VERSION: "21"
+  TRIVY_EXIT_CODE: "0" # set to "1" to fail the build on HIGH/CRITICAL findings
+
+jobs:
+  # ----------------------------------------------------------------
+  # 1-5. Checkout, build, unit tests, JaCoCo coverage
+  # ----------------------------------------------------------------
+  build-and-test:
+    name: Build & Test (Backend)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    outputs:
+      jacoco-generated: ${{ steps.jacoco-check.outputs.exists }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: maven
+
+      - name: Build backend (compile)
+        run: mvn -B -ntp compile
+
+      - name: Run backend unit tests
+        run: mvn -B -ntp test
+
+      - name: Generate JaCoCo coverage report
+        run: mvn -B -ntp verify -DskipTests=false
+
+      - name: Verify JaCoCo report was generated
+        id: jacoco-check
+        run: |
+          if [ -f "target/site/jacoco/jacoco.xml" ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "JaCoCo XML report found."
+            grep -m1 '<counter type="LINE"' target/site/jacoco/jacoco.xml || true
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::JaCoCo report not found - coverage step may have failed silently."
+          fi
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-test-results
+          path: backend/target/surefire-reports/**
+          retention-days: 14
+          if-no-files-found: warn
+
+      - name: Upload JaCoCo coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jacoco-coverage-report
+          path: |
+            backend/target/site/jacoco/**
+            backend/target/site/jacoco/jacoco.xml
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Upload built jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-jar
+          path: backend/target/*.jar
+          retention-days: 7
+
+  # ----------------------------------------------------------------
+  # 6. SonarQube analysis - CONDITIONAL on secrets being configured
+  # ----------------------------------------------------------------
+  sonarqube:
+    name: SonarQube Analysis (conditional)
+    needs: build-and-test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    env:
+      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+      SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+    steps:
+      - name: Checkout repository
+        if: env.SONAR_TOKEN != '' && env.SONAR_HOST_URL != ''
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # SonarQube wants full history for blame/new-code analysis
+
+      - name: Set up Java ${{ env.JAVA_VERSION }}
+        if: env.SONAR_TOKEN != '' && env.SONAR_HOST_URL != ''
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: maven
+
+      - name: Download JaCoCo report
+        if: env.SONAR_TOKEN != '' && env.SONAR_HOST_URL != ''
+        uses: actions/download-artifact@v4
+        with:
+          name: jacoco-coverage-report
+          path: backend/target/site/jacoco
+
+      - name: Run SonarQube scan
+        if: env.SONAR_TOKEN != '' && env.SONAR_HOST_URL != ''
+        run: |
+          mvn -B -ntp verify sonar:sonar \
+            -DskipTests \
+            -Dsonar.host.url="${SONAR_HOST_URL}" \
+            -Dsonar.token="${SONAR_TOKEN}" \
+            -Dsonar.projectKey="${SONAR_PROJECT_KEY:-assqp-backend}" \
+            -Dsonar.coverage.jacoco.xmlReportPaths=target/site/jacoco/jacoco.xml
+        env:
+          SONAR_PROJECT_KEY: ${{ vars.SONAR_PROJECT_KEY }}
+
+      - name: Skip notice
+        if: env.SONAR_TOKEN == '' || env.SONAR_HOST_URL == ''
+        run: |
+          echo "::notice::SONAR_TOKEN and/or SONAR_HOST_URL secrets are not configured for this repository - skipping SonarQube analysis. This does not fail the build. See Settings > Secrets and variables > Actions to enable it."
+
+  # ----------------------------------------------------------------
+  # 7. Trivy security scanning - filesystem/dependency + secret scan
+  #    Runs unconditionally, never requires credentials.
+  # ----------------------------------------------------------------
+  trivy-scan:
+    name: Trivy Filesystem & Secret Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Trivy filesystem + dependency + secret scan
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret,misconfig
+          format: sarif
+          output: trivy-fs-results.sarif
+          severity: CRITICAL,HIGH,MEDIUM,LOW
+          exit-code: ${{ env.TRIVY_EXIT_CODE }}
+
+      - name: Trivy filesystem scan (human-readable table)
+        if: always()
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret,misconfig
+          format: table
+          output: trivy-fs-results.txt
+          severity: CRITICAL,HIGH,MEDIUM,LOW
+          exit-code: "0"
+
+      - name: Trivy filesystem scan (JSON - importable via POST /api/projects/{id}/trivy/import-file)
+        if: always()
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret,misconfig
+          format: json
+          output: trivy-fs-results.json
+          severity: CRITICAL,HIGH,MEDIUM,LOW
+          exit-code: "0"
+
+      - name: Upload Trivy SARIF to code scanning
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-fs-results.sarif
+        continue-on-error: true # older/private-repo plans may not have Advanced Security
+
+      - name: Upload Trivy reports as artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-filesystem-report
+          path: |
+            trivy-fs-results.sarif
+            trivy-fs-results.txt
+            trivy-fs-results.json
+          retention-days: 30
+
+  # ----------------------------------------------------------------
+  # 8. Build Docker images (backend + frontend) - validates both
+  #    Dockerfiles build cleanly. Not pushed anywhere by default.
+  # ----------------------------------------------------------------
+  docker-build:
+    name: Build Docker Images
+    needs: build-and-test
+    runs-on: ubuntu-latest
+    outputs:
+      backend-image: assqp-backend:ci-${{ github.sha }}
+      frontend-image: assqp-frontend:ci-${{ github.sha }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build backend image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./backend
+          file: ./backend/Dockerfile
+          push: false
+          load: true
+          tags: assqp-backend:ci-${{ github.sha }}
+          cache-from: type=gha,scope=backend
+          cache-to: type=gha,mode=max,scope=backend
+
+      - name: Build frontend image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./frontend
+          file: ./frontend/Dockerfile
+          push: false
+          load: true
+          tags: assqp-frontend:ci-${{ github.sha }}
+          build-args: |
+            VITE_API_BASE_URL=${{ vars.VITE_API_BASE_URL || 'http://localhost:8080/api' }}
+          cache-from: type=gha,scope=frontend
+          cache-to: type=gha,mode=max,scope=frontend
+
+      - name: Save images as tarballs for downstream jobs
+        run: |
+          mkdir -p /tmp/images
+          docker save assqp-backend:ci-${{ github.sha }} -o /tmp/images/backend.tar
+          docker save assqp-frontend:ci-${{ github.sha }} -o /tmp/images/frontend.tar
+
+      - name: Upload image tarballs
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-images
+          path: /tmp/images/*.tar
+          retention-days: 3
+
+  # ----------------------------------------------------------------
+  # Trivy image scan - scans the backend image built above
+  # ----------------------------------------------------------------
+  trivy-image-scan:
+    name: Trivy Container Image Scan
+    needs: docker-build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download image tarballs
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-images
+          path: /tmp/images
+
+      - name: Load backend image
+        run: docker load -i /tmp/images/backend.tar
+
+      - name: Trivy image scan (backend)
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          scan-type: image
+          image-ref: assqp-backend:ci-${{ github.sha }}
+          format: table
+          output: trivy-image-backend.txt
+          severity: CRITICAL,HIGH,MEDIUM,LOW
+          exit-code: ${{ env.TRIVY_EXIT_CODE }}
+
+      - name: Trivy image scan (backend, JSON - importable via POST /api/projects/{id}/trivy/import-file)
+        if: always()
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          scan-type: image
+          image-ref: assqp-backend:ci-${{ github.sha }}
+          format: json
+          output: trivy-image-backend.json
+          severity: CRITICAL,HIGH,MEDIUM,LOW
+          exit-code: "0"
+
+      - name: Upload Trivy image report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-image-report
+          path: |
+            trivy-image-backend.txt
+            trivy-image-backend.json
+          retention-days: 30
+
+  # ----------------------------------------------------------------
+  # 9. OWASP ZAP baseline scan - OPTIONAL, only runs against an
+  #    explicitly configured target (never an arbitrary/production URL).
+  #    Triggered by workflow_dispatch input or a ZAP_TARGET_URL repo
+  #    variable; skipped entirely otherwise.
+  # ----------------------------------------------------------------
+  zap-baseline:
+    name: OWASP ZAP Baseline Scan (optional)
+    needs: docker-build
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_zap == true && vars.ZAP_TARGET_URL != '' }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download image tarballs
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-images
+          path: /tmp/images
+
+      - name: Load backend image
+        run: docker load -i /tmp/images/backend.tar
+
+      - name: Start backend for scanning
+        run: |
+          docker run -d --name assqp-backend-ci -p 8080:8080 \
+            -e SPRING_PROFILES_ACTIVE=dev \
+            -e DB_URL="${{ secrets.CI_DB_URL }}" \
+            -e DB_USERNAME="${{ secrets.CI_DB_USERNAME }}" \
+            -e DB_PASSWORD="${{ secrets.CI_DB_PASSWORD }}" \
+            -e JWT_SECRET="${{ secrets.CI_JWT_SECRET || 'ci-only-temporary-secret-not-for-prod-use-000000' }}" \
+            assqp-backend:ci-${{ github.sha }}
+          echo "Waiting for backend to become healthy..."
+          for i in $(seq 1 20); do
+            if curl -sf http://localhost:8080/actuator/health >/dev/null; then
+              echo "Backend is up."
+              break
+            fi
+            sleep 5
+          done
+
+      - name: ZAP baseline scan
+        uses: zaproxy/action-baseline@v0.14.0
+        with:
+          target: ${{ vars.ZAP_TARGET_URL }}
+          cmd_options: "-a"
+          fail_action: false
+          artifact_name: zap-baseline-report
+
+      - name: Stop backend container
+        if: always()
+        run: docker rm -f assqp-backend-ci || true
+
+  # ----------------------------------------------------------------
+  # 10. Final summary - collects what ran / was skipped
+  # ----------------------------------------------------------------
+  pipeline-summary:
+    name: Pipeline Summary
+    if: always()
+    needs: [build-and-test, sonarqube, trivy-scan, docker-build, trivy-image-scan]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Print summary
+        run: |
+          echo "## ASSQP CI/CD Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Build & Test: ${{ needs.build-and-test.result }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- SonarQube (conditional): ${{ needs.sonarqube.result }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Trivy filesystem scan: ${{ needs.trivy-scan.result }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Docker image build: ${{ needs.docker-build.result }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Trivy image scan: ${{ needs.trivy-image-scan.result }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- OWASP ZAP baseline: optional, only runs via manual workflow_dispatch with a configured ZAP_TARGET_URL variable." >> "$GITHUB_STEP_SUMMARY"
